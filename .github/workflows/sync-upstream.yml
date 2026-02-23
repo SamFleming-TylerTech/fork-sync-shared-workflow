@@ -158,7 +158,7 @@ jobs:
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
         id: diff
         run: |
-          DIFF_STATS=$(git diff --stat ${{ inputs.default_branch }}...upstream-tracking)
+          DIFF_STATS=$(git diff --stat origin/${{ inputs.default_branch }}...HEAD)
           echo "diff_stats<<EOF" >> "$GITHUB_OUTPUT"
           echo "${DIFF_STATS}" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -167,7 +167,7 @@ jobs:
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
         id: security
         run: |
-          SECURITY_FILES=$(git diff --name-only ${{ inputs.default_branch }}...upstream-tracking -- \
+          SECURITY_FILES=$(git diff --name-only origin/${{ inputs.default_branch }}...HEAD -- \
             'action.yml' \
             'action.yaml' \
             'Dockerfile' \
