@@ -12,10 +12,6 @@ on:
         required: true
         type: string
 
-concurrency:
-  group: sync-tags
-  cancel-in-progress: false
-
 jobs:
   check-tags:
     runs-on: ubuntu-latest

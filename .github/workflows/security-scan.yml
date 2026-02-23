@@ -3,10 +3,6 @@ name: Security Scan (Reusable)
 on:
   workflow_call:
 
-concurrency:
-  group: security-scan-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   dependency-review:
     runs-on: ubuntu-latest
