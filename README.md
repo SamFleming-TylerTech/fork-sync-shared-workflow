@@ -1,10 +1,14 @@
 # Fork Action Sync Templates
 
-Reusable GitHub Actions workflows for managing forked repositories with automated upstream sync, tag monitoring, and security scanning.
+Reusable GitHub Actions workflows for managing forked third-party GitHub Actions with automated upstream sync, tag monitoring, and security scanning.
 
 ## Overview
 
-These templates are used by forks managed via [fork-action.sh](https://github.com/tyler-technologies-oss/fork-project-workflow). Each fork contains thin caller workflows (~20 lines) that reference these reusable workflows, enabling centralized maintenance of sync logic.
+When you fork a third-party GitHub Action to pin it for supply chain security, you need to keep it in sync with upstream while reviewing changes before they reach your workflows. These reusable workflows automate that process.
+
+Each fork contains thin caller workflows (~20 lines) that reference these reusable workflows via `workflow_call`. Centralized maintenance means bug fixes and detection improvements propagate to all forks automatically via the floating `@v1` tag.
+
+Forks are bootstrapped by [`fork-action.sh`](https://github.com/SamFleming-TylerTech/fork-project-workflow), which creates the caller workflows, branch structure, and manifest.
 
 ## Workflows
 
