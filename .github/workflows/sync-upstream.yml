@@ -124,20 +124,28 @@ jobs:
       - name: Update FORK_MANIFEST.json
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
         run: |
-          jq \
-            --arg sha "${{ steps.compare.outputs.upstream_sha }}" \
-            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '.sync.last_synced_sha = $sha | .sync.last_synced_date = $date' \
-            FORK_MANIFEST.json > FORK_MANIFEST.json.tmp \
-            && mv FORK_MANIFEST.json.tmp FORK_MANIFEST.json
+          if [ -f FORK_MANIFEST.json ]; then
+            jq \
+              --arg sha "${{ steps.compare.outputs.upstream_sha }}" \
+              --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '.sync.last_synced_sha = $sha | .sync.last_synced_date = $date' \
+              FORK_MANIFEST.json > FORK_MANIFEST.json.tmp \
+              && mv FORK_MANIFEST.json.tmp FORK_MANIFEST.json
+          else
+            echo "FORK_MANIFEST.json not found on upstream-tracking branch, skipping manifest update."
+          fi
 
       - name: Commit manifest update
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add FORK_MANIFEST.json
-          git commit -m "chore: update sync manifest"
+          git add FORK_MANIFEST.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit."
+          else
+            git commit -m "chore: update sync manifest"
+          fi
 
       - name: Push upstream-tracking
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
