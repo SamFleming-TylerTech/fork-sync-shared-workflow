@@ -8,7 +8,7 @@ When you fork a third-party GitHub Action to pin it for supply chain security, y
 
 Each fork contains thin caller workflows (~20 lines) that reference these reusable workflows via `workflow_call`. Centralized maintenance means bug fixes and detection improvements propagate to all forks automatically via the floating `@v1` tag.
 
-Forks are bootstrapped by [`fork-action.sh`](https://github.com/SamFleming-TylerTech/fork-project-workflow), which creates the caller workflows, branch structure, and manifest.
+Forks are bootstrapped by [`fork-action.sh`](https://github.com/SamFleming-TylerTech/fork-project-workflow/blob/main/fork-action.sh), which creates the caller workflows, branch structure, and manifest.
 
 ## Workflows
 
