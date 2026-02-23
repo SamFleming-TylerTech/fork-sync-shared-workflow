@@ -1,0 +1,245 @@
+name: Sync Upstream (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      upstream_owner:
+        description: 'Owner of the upstream repository'
+        required: true
+        type: string
+      upstream_repo:
+        description: 'Name of the upstream repository'
+        required: true
+        type: string
+      default_branch:
+        description: 'Default branch of the upstream repository'
+        required: true
+        type: string
+      force:
+        description: 'Force sync even if already up to date'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: upstream-tracking
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}.git
+
+      - name: Fetch upstream default branch
+        run: git fetch upstream ${{ inputs.default_branch }}
+
+      - name: Compare SHAs
+        id: compare
+        run: |
+          CURRENT_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse upstream/${{ inputs.default_branch }})
+          echo "current_sha=${CURRENT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "${CURRENT_SHA}" = "${UPSTREAM_SHA}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Already in sync"
+            echo "in_sync=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Updates available: ${CURRENT_SHA} -> ${UPSTREAM_SHA}"
+            echo "in_sync=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Exit early if in sync
+        if: steps.compare.outputs.in_sync == 'true'
+        run: |
+          echo "Fork is already in sync with upstream. Nothing to do."
+          exit 0
+
+      - name: Attempt fast-forward merge
+        if: steps.compare.outputs.in_sync == 'false'
+        id: merge
+        run: |
+          if git merge --ff-only upstream/${{ inputs.default_branch }}; then
+            echo "merge_success=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "merge_success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open divergence issue on merge failure
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '[Action Required] Upstream divergence detected',
+              labels: ['upstream-sync', 'needs-security-review'],
+              body: [
+                '## Upstream Divergence Detected',
+                '',
+                'The `upstream-tracking` branch has diverged from `${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}@${{ inputs.default_branch }}` and cannot be fast-forward merged.',
+                '',
+                '### Manual Resolution Steps',
+                '',
+                '1. Fetch the upstream changes locally:',
+                '   ```bash',
+                '   git remote add upstream https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}.git',
+                '   git fetch upstream ${{ inputs.default_branch }}',
+                '   ```',
+                '2. Check out the `upstream-tracking` branch:',
+                '   ```bash',
+                '   git checkout upstream-tracking',
+                '   ```',
+                '3. Rebase or merge manually:',
+                '   ```bash',
+                '   git rebase upstream/${{ inputs.default_branch }}',
+                '   ```',
+                '4. Resolve any conflicts and push:',
+                '   ```bash',
+                '   git push origin upstream-tracking',
+                '   ```',
+                '',
+                '### Details',
+                '',
+                '- **Current SHA:** `${{ steps.compare.outputs.current_sha }}`',
+                '- **Upstream SHA:** `${{ steps.compare.outputs.upstream_sha }}`',
+              ].join('\n')
+            });
+
+      - name: Fail workflow on divergence
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'false'
+        run: |
+          echo "::error::Upstream divergence detected. Fast-forward merge failed."
+          exit 1
+
+      - name: Update FORK_MANIFEST.json
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          jq \
+            --arg sha "${{ steps.compare.outputs.upstream_sha }}" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.sync.last_synced_sha = $sha | .sync.last_synced_date = $date' \
+            FORK_MANIFEST.json > FORK_MANIFEST.json.tmp \
+            && mv FORK_MANIFEST.json.tmp FORK_MANIFEST.json
+
+      - name: Commit manifest update
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add FORK_MANIFEST.json
+          git commit -m "chore: update sync manifest"
+
+      - name: Push upstream-tracking
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        run: git push origin upstream-tracking
+
+      - name: Generate diff stats
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        id: diff
+        run: |
+          DIFF_STATS=$(git diff --stat ${{ inputs.default_branch }}...upstream-tracking)
+          echo "diff_stats<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${DIFF_STATS}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Check for security-relevant changes
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        id: security
+        run: |
+          SECURITY_FILES=$(git diff --name-only ${{ inputs.default_branch }}...upstream-tracking -- \
+            'action.yml' \
+            'action.yaml' \
+            'Dockerfile' \
+            'package.json' \
+            'package-lock.json' \
+            '*.ps1' \
+            '*.sh' \
+            'dist/' \
+            'node_modules/' \
+          || true)
+
+          if [ -n "${SECURITY_FILES}" ]; then
+            echo "has_security_changes=true" >> "$GITHUB_OUTPUT"
+            echo "security_files<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${SECURITY_FILES}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_security_changes=false" >> "$GITHUB_OUTPUT"
+            echo "security_files=None detected" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if a PR already exists from upstream-tracking to the default branch
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --base ${{ inputs.default_branch }} \
+            --head upstream-tracking \
+            --state open \
+            --json number \
+            --jq 'length')
+
+          if [ "${EXISTING_PR}" != "0" ]; then
+            echo "Sync PR already exists, skipping creation."
+            exit 0
+          fi
+
+          # Write PR body to temp file to avoid heredoc indentation issues
+          cat > /tmp/pr_body.md <<'PR_BODY'
+          ## Upstream Sync
+
+          Syncing changes from [`${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}@${{ inputs.default_branch }}`](https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}).
+
+          ### Diff Stats
+
+          ```
+          ${{ steps.diff.outputs.diff_stats }}
+          ```
+
+          ### Security-Relevant Files
+
+          ```
+          ${{ steps.security.outputs.security_files }}
+          ```
+
+          ### Upstream Comparison
+
+          [`${{ steps.compare.outputs.current_sha }}...${{ steps.compare.outputs.upstream_sha }}`](https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}/compare/${{ steps.compare.outputs.current_sha }}...${{ steps.compare.outputs.upstream_sha }})
+
+          ### Review Checklist
+
+          - [ ] Check `action.yml` / `action.yaml` for unexpected changes
+          - [ ] Check for new or modified dependencies
+          - [ ] Check for obfuscated or minified code changes
+          - [ ] Run security scan on changed files
+          - [ ] Verify no secrets or credentials exposed
+          PR_BODY
+
+          # Strip leading whitespace from each line
+          sed -i 's/^          //' /tmp/pr_body.md
+
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base ${{ inputs.default_branch }} \
+            --head upstream-tracking \
+            --title "chore: sync upstream ${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}" \
+            --label "upstream-sync" \
+            --label "needs-security-review" \
+            --body-file /tmp/pr_body.md

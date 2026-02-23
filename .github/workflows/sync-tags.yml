@@ -1,0 +1,326 @@
+name: Sync Tags (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      upstream_owner:
+        description: 'Owner of the upstream repository'
+        required: true
+        type: string
+      upstream_repo:
+        description: 'Name of the upstream repository'
+        required: true
+        type: string
+
+concurrency:
+  group: sync-tags
+  cancel-in-progress: false
+
+jobs:
+  check-tags:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Fetch upstream tags with SHAs
+        id: upstream-tags
+        run: |
+          # Fetch full tag+SHA listing (all entries including ^{} dereferences)
+          git ls-remote --tags https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}.git \
+            > /tmp/upstream_tag_raw.txt
+
+          # Tag object SHAs (excluding ^{})
+          grep -v '\^{}' /tmp/upstream_tag_raw.txt > /tmp/upstream_tag_shas.txt
+
+          # Extract tag names only
+          awk '{print $2}' /tmp/upstream_tag_shas.txt | \
+            sed 's|refs/tags/||' | \
+            sort -V > /tmp/upstream_tags.txt
+
+          # Build dereferenced SHA map: for each tag, prefer ^{} SHA (commit) over tag object SHA
+          # This resolves annotated tags to their underlying commit
+          > /tmp/upstream_tag_commits.txt
+          while IFS= read -r TAG; do
+            [ -z "${TAG}" ] && continue
+            DEREF_SHA=$(grep "refs/tags/${TAG}\^{}$" /tmp/upstream_tag_raw.txt | awk '{print $1}')
+            if [ -z "${DEREF_SHA}" ]; then
+              DEREF_SHA=$(grep "refs/tags/${TAG}$" /tmp/upstream_tag_raw.txt | awk '{print $1}')
+            fi
+            echo "${DEREF_SHA} ${TAG}" >> /tmp/upstream_tag_commits.txt
+          done < /tmp/upstream_tags.txt
+
+          echo "Upstream tags found: $(wc -l < /tmp/upstream_tags.txt)"
+          cat /tmp/upstream_tags.txt
+
+      - name: Fetch fork tags with SHAs
+        id: fork-tags
+        run: |
+          git ls-remote --tags https://github.com/${GITHUB_REPOSITORY}.git \
+            > /tmp/fork_tag_raw.txt
+
+          grep -v '\^{}' /tmp/fork_tag_raw.txt > /tmp/fork_tag_shas.txt
+
+          awk '{print $2}' /tmp/fork_tag_shas.txt | \
+            sed 's|refs/tags/||' | \
+            sort -V > /tmp/fork_tags.txt
+
+          # Build dereferenced SHA map (same logic as upstream)
+          > /tmp/fork_tag_commits.txt
+          while IFS= read -r TAG; do
+            [ -z "${TAG}" ] && continue
+            DEREF_SHA=$(grep "refs/tags/${TAG}\^{}$" /tmp/fork_tag_raw.txt | awk '{print $1}')
+            if [ -z "${DEREF_SHA}" ]; then
+              DEREF_SHA=$(grep "refs/tags/${TAG}$" /tmp/fork_tag_raw.txt | awk '{print $1}')
+            fi
+            echo "${DEREF_SHA} ${TAG}" >> /tmp/fork_tag_commits.txt
+          done < /tmp/fork_tags.txt
+
+          echo "Fork tags found: $(wc -l < /tmp/fork_tags.txt)"
+          cat /tmp/fork_tags.txt
+
+      - name: Find new tags
+        id: new-tags
+        run: |
+          comm -23 /tmp/upstream_tags.txt /tmp/fork_tags.txt > /tmp/new_tags.txt
+
+          NEW_TAG_COUNT=$(wc -l < /tmp/new_tags.txt)
+          echo "new_tag_count=${NEW_TAG_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "New tags found: ${NEW_TAG_COUNT}"
+          cat /tmp/new_tags.txt
+
+      - name: Detect tag mutations
+        id: mutations
+        run: |
+          # Compare dereferenced commit SHAs for tags that exist in BOTH upstream and fork
+          # Using commit SHAs (not tag object SHAs) avoids false positives when
+          # fork has annotated tags and upstream has lightweight tags
+          comm -12 /tmp/upstream_tags.txt /tmp/fork_tags.txt > /tmp/common_tags.txt
+
+          MUTATED_TAGS=""
+          MUTATION_COUNT=0
+
+          while IFS= read -r TAG; do
+            [ -z "${TAG}" ] && continue
+
+            UPSTREAM_SHA=$(grep " ${TAG}$" /tmp/upstream_tag_commits.txt | awk '{print $1}')
+            FORK_SHA=$(grep " ${TAG}$" /tmp/fork_tag_commits.txt | awk '{print $1}')
+
+            if [ -n "${UPSTREAM_SHA}" ] && [ -n "${FORK_SHA}" ] && [ "${UPSTREAM_SHA}" != "${FORK_SHA}" ]; then
+              echo "TAG MUTATION DETECTED: ${TAG} upstream=${UPSTREAM_SHA} fork=${FORK_SHA}"
+              MUTATED_TAGS="${MUTATED_TAGS}${TAG} upstream=${UPSTREAM_SHA} fork=${FORK_SHA}\n"
+              MUTATION_COUNT=$((MUTATION_COUNT + 1))
+            fi
+          done < /tmp/common_tags.txt
+
+          echo "mutation_count=${MUTATION_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "mutated_tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "${MUTATED_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "Tag mutations detected: ${MUTATION_COUNT}"
+
+      - name: Detect tag deletions
+        id: deletions
+        run: |
+          # Tags in fork but NOT in upstream (upstream deleted them)
+          comm -13 /tmp/upstream_tags.txt /tmp/fork_tags.txt > /tmp/deleted_upstream_tags.txt
+
+          # Filter out tags that were never in upstream (fork-only tags like local patches)
+          # We can only detect this if the tag name matches common upstream patterns
+          DELETED_COUNT=$(wc -l < /tmp/deleted_upstream_tags.txt)
+          echo "deletion_count=${DELETED_COUNT}" >> "$GITHUB_OUTPUT"
+
+          if [ "${DELETED_COUNT}" -gt 0 ]; then
+            echo "Tags in fork but not in upstream: ${DELETED_COUNT}"
+            cat /tmp/deleted_upstream_tags.txt
+          fi
+
+      - name: Create issues for new tags
+        if: steps.new-tags.outputs.new_tag_count != '0'
+        id: create-issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUES_CREATED=0
+
+          while IFS= read -r TAG; do
+            [ -z "${TAG}" ] && continue
+
+            ISSUE_TITLE="[Security Review] New upstream release: ${TAG}"
+
+            EXISTING=$(gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --search "${ISSUE_TITLE}" \
+              --state all \
+              --limit 1 \
+              --json title \
+              --jq '.[].title' 2>/dev/null || true)
+
+            if [ "${EXISTING}" = "${ISSUE_TITLE}" ]; then
+              echo "Issue already exists for tag ${TAG}, skipping"
+              continue
+            fi
+
+            TAG_SHA=$(grep "refs/tags/${TAG}$" /tmp/upstream_tag_shas.txt | awk '{print $1}')
+            if [ -z "${TAG_SHA}" ]; then
+              TAG_SHA="unknown"
+            fi
+
+            gh issue create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${ISSUE_TITLE}" \
+              --label "upstream-release,needs-security-review" \
+              --body "## New Upstream Release: ${TAG}
+
+          A new tag \`${TAG}\` has been detected in the upstream repository.
+
+          - **Upstream Release:** [${TAG}](https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}/releases/tag/${TAG})
+          - **Tag:** \`${TAG}\`
+          - **Commit SHA:** \`${TAG_SHA}\`
+
+          ### Security Review Checklist
+
+          - [ ] Review the changelog and release notes
+          - [ ] Diff against the previous tag for unexpected changes
+          - [ ] Check for new or modified dependencies
+          - [ ] Run CodeQL or static analysis scan on the release
+          - [ ] Check for added or modified binary files
+
+          ### After Review: Create the Tag
+
+          Once the security review is complete, create and push the tag:
+
+          \`\`\`bash
+          git tag -a ${TAG} ${TAG_SHA} -m \"Reviewed: \$(date -u +%Y-%m-%dT%H:%M:%SZ) by @reviewer\"
+          git push origin ${TAG}
+          \`\`\`
+
+          > **Do NOT create the tag until the security review is complete.**"
+
+            ISSUES_CREATED=$((ISSUES_CREATED + 1))
+            echo "Created issue for tag ${TAG}"
+          done < /tmp/new_tags.txt
+
+          echo "issues_created=${ISSUES_CREATED}" >> "$GITHUB_OUTPUT"
+
+      - name: Create alerts for tag mutations
+        if: steps.mutations.outputs.mutation_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          while IFS= read -r LINE; do
+            [ -z "${LINE}" ] && continue
+
+            TAG=$(echo "${LINE}" | awk '{print $1}')
+            UPSTREAM_SHA=$(echo "${LINE}" | awk -F= '{print $2}' | awk '{print $1}')
+            FORK_SHA=$(echo "${LINE}" | awk -F= '{print $3}')
+
+            ISSUE_TITLE="[SECURITY ALERT] Upstream tag mutated: ${TAG}"
+
+            EXISTING=$(gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --search "${ISSUE_TITLE}" \
+              --state open \
+              --limit 1 \
+              --json title \
+              --jq '.[].title' 2>/dev/null || true)
+
+            if [ "${EXISTING}" = "${ISSUE_TITLE}" ]; then
+              echo "Alert already exists for mutated tag ${TAG}, skipping"
+              continue
+            fi
+
+            gh issue create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${ISSUE_TITLE}" \
+              --label "upstream-sync,needs-security-review,security-alert" \
+              --body "## Upstream Tag Mutation Detected: ${TAG}
+
+          The upstream tag \`${TAG}\` now points to a **different commit** than the fork's copy. This could indicate:
+
+          - A **supply chain attack** (tag force-pushed to malicious code)
+          - An upstream maintainer **re-tagging** a release (bad practice but sometimes benign)
+          - A **compromised upstream account**
+
+          ### Details
+
+          | | SHA |
+          |---|---|
+          | **Fork (pinned)** | \`${FORK_SHA}\` |
+          | **Upstream (changed)** | \`${UPSTREAM_SHA}\` |
+
+          ### Upstream comparison
+
+          [\`${FORK_SHA}...${UPSTREAM_SHA}\`](https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}/compare/${FORK_SHA}...${UPSTREAM_SHA})
+
+          ### Required Actions
+
+          1. **Do NOT update the fork tag** until investigation is complete
+          2. Review the diff between the two SHAs above
+          3. Check upstream release notes and issue tracker for explanations
+          4. Contact the upstream maintainer if no explanation is found
+          5. If benign: close this issue with a note explaining the change
+          6. If malicious: consider removing the fork tag and notifying dependent teams
+
+          > **The fork's tag is safe** -- it still points to the original reviewed commit."
+
+            echo "Created mutation alert for tag ${TAG}"
+          done <<< "${{ steps.mutations.outputs.mutated_tags }}"
+
+      - name: Create alerts for tag deletions
+        if: steps.deletions.outputs.deletion_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          while IFS= read -r TAG; do
+            [ -z "${TAG}" ] && continue
+
+            ISSUE_TITLE="[Security Notice] Upstream tag removed: ${TAG}"
+
+            EXISTING=$(gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --search "${ISSUE_TITLE}" \
+              --state all \
+              --limit 1 \
+              --json title \
+              --jq '.[].title' 2>/dev/null || true)
+
+            if [ "${EXISTING}" = "${ISSUE_TITLE}" ]; then
+              echo "Notice already exists for deleted tag ${TAG}, skipping"
+              continue
+            fi
+
+            gh issue create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${ISSUE_TITLE}" \
+              --label "upstream-sync,needs-security-review" \
+              --body "## Upstream Tag Removed: ${TAG}
+
+          The tag \`${TAG}\` exists in this fork but is **no longer present** in the upstream repository.
+
+          This could indicate:
+
+          - Upstream maintainer **retracted a release** (e.g. due to a bug or vulnerability)
+          - Upstream repository **housekeeping** (removing old pre-releases)
+          - A **compromised upstream account** deleting tags before re-creating them
+
+          ### Required Actions
+
+          - [ ] Check the upstream release page for context: [${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }} releases](https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}/releases)
+          - [ ] Determine if the fork should continue using this tag
+          - [ ] If the tag was retracted due to a vulnerability, stop using it immediately
+
+          > **The fork's tag is unaffected** -- it still exists and points to the original commit."
+
+            echo "Created deletion notice for tag ${TAG}"
+          done < /tmp/deleted_upstream_tags.txt
+
+      - name: Summary
+        run: |
+          echo "## Sync Tags Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **New tags found:** ${{ steps.new-tags.outputs.new_tag_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag mutations detected:** ${{ steps.mutations.outputs.mutation_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag deletions detected:** ${{ steps.deletions.outputs.deletion_count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Issues created:** ${{ steps.create-issues.outputs.issues_created || '0' }}" >> "$GITHUB_STEP_SUMMARY"

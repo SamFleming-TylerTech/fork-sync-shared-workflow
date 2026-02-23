@@ -1,0 +1,206 @@
+name: Security Scan (Reusable)
+
+on:
+  workflow_call:
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: always
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+
+  diff-summary:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate diff analysis
+        id: diff
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+          # Total change statistics
+          TOTAL_STATS=$(git diff --shortstat "${BASE_SHA}...${HEAD_SHA}")
+          FILES_CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" | wc -l)
+          LINES_ADDED=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | awk '{s+=$1} END {print s+0}')
+          LINES_REMOVED=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | awk '{s+=$2} END {print s+0}')
+
+          echo "files_changed=${FILES_CHANGED}" >> "$GITHUB_OUTPUT"
+          echo "lines_added=${LINES_ADDED}" >> "$GITHUB_OUTPUT"
+          echo "lines_removed=${LINES_REMOVED}" >> "$GITHUB_OUTPUT"
+
+          # Action manifest changes
+          MANIFEST_CHANGES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- 'action.yml' 'action.yaml' || true)
+          echo "manifest_changes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${MANIFEST_CHANGES:-None}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # Dependency file changes
+          DEPENDENCY_CHANGES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
+            'package.json' \
+            'package-lock.json' \
+            'yarn.lock' \
+            'pnpm-lock.yaml' \
+            'requirements.txt' \
+            'requirements*.txt' \
+            'Pipfile' \
+            'Pipfile.lock' \
+            'go.sum' \
+            'go.mod' \
+            'Gemfile' \
+            'Gemfile.lock' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+          || true)
+          echo "dependency_changes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${DEPENDENCY_CHANGES:-None}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # Binary files
+          BINARY_CHANGES=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | grep -E '^-\s+-\s+' | awk '{print $3}' || true)
+          echo "binary_changes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${BINARY_CHANGES:-None}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # Script changes
+          SCRIPT_CHANGES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- '*.sh' '*.ps1' '*.py' || true)
+          echo "script_changes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${SCRIPT_CHANGES:-None}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # Risk indicators
+          RISK_ITEMS=""
+          if [ -n "${BINARY_CHANGES}" ] && [ "${BINARY_CHANGES}" != "" ]; then
+            RISK_ITEMS="${RISK_ITEMS}- **Binary files changed** -- requires manual inspection\n"
+          fi
+          if [ -n "${MANIFEST_CHANGES}" ] && [ "${MANIFEST_CHANGES}" != "" ]; then
+            RISK_ITEMS="${RISK_ITEMS}- **Action manifest changed** -- review inputs, outputs, and entrypoint\n"
+          fi
+          if [ -n "${DEPENDENCY_CHANGES}" ] && [ "${DEPENDENCY_CHANGES}" != "" ]; then
+            RISK_ITEMS="${RISK_ITEMS}- **Dependency files changed** -- check for new or modified packages\n"
+          fi
+          if [ -z "${RISK_ITEMS}" ]; then
+            RISK_ITEMS="No high-risk indicators detected."
+          fi
+          echo "risk_items<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "${RISK_ITEMS}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post diff summary as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## Security Diff Summary
+
+            | Metric | Count |
+            |--------|-------|
+            | Files changed | ${{ steps.diff.outputs.files_changed }} |
+            | Lines added | ${{ steps.diff.outputs.lines_added }} |
+            | Lines removed | ${{ steps.diff.outputs.lines_removed }} |
+
+            ### Action Manifest Changes
+            \`\`\`
+            ${{ steps.diff.outputs.manifest_changes }}
+            \`\`\`
+
+            ### Dependency File Changes
+            \`\`\`
+            ${{ steps.diff.outputs.dependency_changes }}
+            \`\`\`
+
+            ### Binary Files Added/Modified
+            \`\`\`
+            ${{ steps.diff.outputs.binary_changes }}
+            \`\`\`
+
+            ### Script Changes
+            \`\`\`
+            ${{ steps.diff.outputs.script_changes }}
+            \`\`\`
+
+            ### Risk Assessment
+
+            ${{ steps.diff.outputs.risk_items }}
+
+            ### Review Checklist
+
+            - [ ] Reviewed all action manifest changes
+            - [ ] Verified dependency changes are expected
+            - [ ] Inspected any binary file additions
+            - [ ] Reviewed script changes for malicious content
+            - [ ] Confirmed no secrets or credentials in diff
+            `;
+
+            // Find existing comment from this workflow
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = '## Security Diff Summary';
+            const existing = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
