@@ -189,10 +189,18 @@ jobs:
             echo "security_files=None detected" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Generate App token for PR creation
+        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.FORK_SYNC_APP_ID }}
+          private-key: ${{ secrets.FORK_SYNC_APP_PRIVATE_KEY }}
+
       - name: Create pull request
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           # Check if a PR already exists from upstream-tracking to the default branch
           EXISTING_PR=$(gh pr list \
