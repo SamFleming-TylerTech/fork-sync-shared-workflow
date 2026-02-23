@@ -150,6 +150,33 @@ git tag -f v1 -m "Latest v1.x release"
 git push origin v1.1.0 && git push origin v1 --force
 ```
 
+## Known Limitations
+
+### Security Scan does not auto-trigger on workflow-created PRs
+
+GitHub Actions prevents `GITHUB_TOKEN`-initiated events from triggering other workflows (to avoid infinite loops). Since Sync Upstream creates the PR using `GITHUB_TOKEN`, the `pull_request.opened` event does **not** fire for the Security Scan workflow.
+
+**When the Security Scan DOES trigger:**
+
+| Action | Token | Triggers Scan? |
+|--------|-------|---------------|
+| Sync Upstream creates PR | `GITHUB_TOKEN` | No |
+| Human adds a label in GitHub UI | Human PAT | Yes (`labeled`) |
+| Human pushes to `upstream-tracking` | Human PAT | Yes (`synchronize`) |
+| Human closes/reopens PR | Human PAT | No (not in trigger list) |
+
+**Practical impact:** The scan does not run until a human interacts with the PR. Since human review is required before merging upstream changes anyway, this is a minor gap -- the reviewer's first interaction with the PR (e.g., adding a label) triggers the scan.
+
+**Possible future fix:** Add a `workflow_run` trigger to the Security Scan caller so it fires when Sync Upstream completes. This requires modifying the reusable workflow to resolve PR context from the GitHub API (since `workflow_run` events don't carry `pull_request` context).
+
+### Concurrency blocks must be in callers only
+
+GitHub Actions rejects workflows when both the caller and the reusable workflow define `concurrency` blocks. All `concurrency` configuration belongs in the caller workflows, not in the reusable templates.
+
+### Reusable workflow job names are prefixed
+
+When called from a caller, job names are prefixed with the caller's job name. For example, if the caller job is named `scan` and the reusable workflow has a job `dependency-review`, the check name becomes `scan / dependency-review`. Branch protection rules must use the prefixed names.
+
 ## Requirements
 
 - The templates repo must be **public** for cross-repo `workflow_call` to work
