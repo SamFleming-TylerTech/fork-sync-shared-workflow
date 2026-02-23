@@ -152,22 +152,53 @@ git push origin v1.1.0 && git push origin v1 --force
 
 ## Known Limitations
 
-### Security Scan does not auto-trigger on workflow-created PRs
+### Security Scan auto-trigger requires a GitHub App (current)
 
-GitHub Actions prevents `GITHUB_TOKEN`-initiated events from triggering other workflows (to avoid infinite loops). Since Sync Upstream creates the PR using `GITHUB_TOKEN`, the `pull_request.opened` event does **not** fire for the Security Scan workflow.
+The Sync Upstream workflow uses a GitHub App token (`actions/create-github-app-token`) to create PRs. PRs created by a GitHub App identity trigger `pull_request` events normally, so the Security Scan auto-fires without manual intervention.
 
-**When the Security Scan DOES trigger:**
+**Required secrets (per-repo or org-level):**
 
-| Action | Token | Triggers Scan? |
-|--------|-------|---------------|
-| Sync Upstream creates PR | `GITHUB_TOKEN` | No |
-| Human adds a label in GitHub UI | Human PAT | Yes (`labeled`) |
-| Human pushes to `upstream-tracking` | Human PAT | Yes (`synchronize`) |
-| Human closes/reopens PR | Human PAT | No (not in trigger list) |
+| Secret | Description |
+|--------|-------------|
+| `FORK_SYNC_APP_ID` | GitHub App ID (numeric) |
+| `FORK_SYNC_APP_PRIVATE_KEY` | GitHub App private key (PEM format) |
 
-**Practical impact:** The scan does not run until a human interacts with the PR. Since human review is required before merging upstream changes anyway, this is a minor gap -- the reviewer's first interaction with the PR (e.g., adding a label) triggers the scan.
+**GitHub App setup:**
+1. Create a GitHub App (Settings > Developer settings > GitHub Apps)
+2. Permissions: Contents (read/write), Pull requests (read/write), Issues (read/write)
+3. Webhook: disabled (not needed)
+4. Install the App on the target org or repos
+5. Add the App ID and private key as org-level secrets (inherited by all forks)
 
-**Possible future fix:** Add a `workflow_run` trigger to the Security Scan caller so it fires when Sync Upstream completes. This requires modifying the reusable workflow to resolve PR context from the GitHub API (since `workflow_run` events don't carry `pull_request` context).
+**At scale:** One App installation per org. Two org-level secrets. Zero per-fork configuration.
+
+#### Rollback: removing the GitHub App dependency
+
+If the GitHub App cannot be maintained, revert to `GITHUB_TOKEN` by checking out the `v1.0.5` tag:
+
+```
+v1.0.5  -- last version using GITHUB_TOKEN (no App dependency)
+v1.1.0  -- first version using GitHub App token
+```
+
+To roll back the floating `v1` tag:
+```bash
+cd fork-action-sync-templates
+git tag -f v1 v1.0.5
+git push origin v1 --force
+```
+
+All forks using `@v1` will immediately pick up the rollback. The `FORK_SYNC_APP_ID` and `FORK_SYNC_APP_PRIVATE_KEY` secrets can then be removed.
+
+**Impact of rollback:** The Security Scan will no longer auto-trigger when Sync Upstream creates a PR. It will still trigger on any human interaction with the PR:
+
+| Action | Triggers Scan? |
+|--------|---------------|
+| Sync Upstream creates PR (GITHUB_TOKEN) | No |
+| Human adds a label in GitHub UI | Yes (`labeled`) |
+| Human pushes to `upstream-tracking` | Yes (`synchronize`) |
+
+For automated security monitoring at scale, this means scan results are not available until a human touches each PR. If this is acceptable, the rollback is safe. If unattended scanning is required, the GitHub App is necessary.
 
 ### Concurrency blocks must be in callers only
 
