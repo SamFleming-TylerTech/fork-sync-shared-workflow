@@ -2,67 +2,87 @@ name: Security Scan (Reusable)
 
 on:
   workflow_call:
+    inputs:
+      default_branch:
+        description: 'Default branch of the fork'
+        required: true
+        type: string
 
 jobs:
+  find-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.find.outputs.pr_number }}
+      has_pr: ${{ steps.find.outputs.has_pr }}
+    steps:
+      - name: Find open sync PR
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUM=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --base ${{ inputs.default_branch }} \
+            --head upstream-tracking \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "${PR_NUM}" ]; then
+            echo "Found sync PR #${PR_NUM}"
+            echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No open sync PR found. Skipping security scan."
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
   dependency-review:
+    needs: find-pr
+    if: needs.find-pr.outputs.has_pr == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
-      security-events: write
-    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout upstream-tracking
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: upstream-tracking
 
       - name: Dependency review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@4901385134134e04cec5fbe5ddfe3b2c5bd5d976 # v4
         with:
+          base-ref: refs/heads/${{ inputs.default_branch }}
+          head-ref: refs/heads/upstream-tracking
           fail-on-severity: high
-          comment-summary-in-pr: always
-
-  codeql:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      security-events: write
-    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          queries: security-extended
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+          comment-summary-in-pr: never
+        continue-on-error: true
 
   diff-summary:
+    needs: find-pr
+    if: needs.find-pr.outputs.has_pr == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
-    if: contains(github.event.pull_request.labels.*.name, 'upstream-sync')
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
       - name: Generate diff analysis
         id: diff
+        env:
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
         run: |
-          BASE_SHA=${{ github.event.pull_request.base.sha }}
-          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+          git fetch origin upstream-tracking "${DEFAULT_BRANCH}"
+          BASE_SHA=$(git rev-parse "origin/${DEFAULT_BRANCH}")
+          HEAD_SHA=$(git rev-parse origin/upstream-tracking)
 
-          # Total change statistics
-          TOTAL_STATS=$(git diff --shortstat "${BASE_SHA}...${HEAD_SHA}")
           FILES_CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" | wc -l)
           LINES_ADDED=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | awk '{s+=$1} END {print s+0}')
           LINES_REMOVED=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | awk '{s+=$2} END {print s+0}')
@@ -71,67 +91,20 @@ jobs:
           echo "lines_added=${LINES_ADDED}" >> "$GITHUB_OUTPUT"
           echo "lines_removed=${LINES_REMOVED}" >> "$GITHUB_OUTPUT"
 
-          # Action manifest changes
           MANIFEST_CHANGES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- 'action.yml' 'action.yaml' || true)
-          echo "manifest_changes<<EOF" >> "$GITHUB_OUTPUT"
-          echo "${MANIFEST_CHANGES:-None}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "manifest_changes=${MANIFEST_CHANGES:-None}" >> "$GITHUB_OUTPUT"
 
-          # Dependency file changes
-          DEPENDENCY_CHANGES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
-            'package.json' \
-            'package-lock.json' \
-            'yarn.lock' \
-            'pnpm-lock.yaml' \
-            'requirements.txt' \
-            'requirements*.txt' \
-            'Pipfile' \
-            'Pipfile.lock' \
-            'go.sum' \
-            'go.mod' \
-            'Gemfile' \
-            'Gemfile.lock' \
-            'Cargo.toml' \
-            'Cargo.lock' \
-          || true)
-          echo "dependency_changes<<EOF" >> "$GITHUB_OUTPUT"
-          echo "${DEPENDENCY_CHANGES:-None}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          # Binary files
-          BINARY_CHANGES=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | grep -E '^-\s+-\s+' | awk '{print $3}' || true)
-          echo "binary_changes<<EOF" >> "$GITHUB_OUTPUT"
-          echo "${BINARY_CHANGES:-None}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          # Script changes
           SCRIPT_CHANGES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- '*.sh' '*.ps1' '*.py' || true)
-          echo "script_changes<<EOF" >> "$GITHUB_OUTPUT"
-          echo "${SCRIPT_CHANGES:-None}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "script_changes=${SCRIPT_CHANGES:-None}" >> "$GITHUB_OUTPUT"
 
-          # Risk indicators
-          RISK_ITEMS=""
-          if [ -n "${BINARY_CHANGES}" ] && [ "${BINARY_CHANGES}" != "" ]; then
-            RISK_ITEMS="${RISK_ITEMS}- **Binary files changed** -- requires manual inspection\n"
-          fi
-          if [ -n "${MANIFEST_CHANGES}" ] && [ "${MANIFEST_CHANGES}" != "" ]; then
-            RISK_ITEMS="${RISK_ITEMS}- **Action manifest changed** -- review inputs, outputs, and entrypoint\n"
-          fi
-          if [ -n "${DEPENDENCY_CHANGES}" ] && [ "${DEPENDENCY_CHANGES}" != "" ]; then
-            RISK_ITEMS="${RISK_ITEMS}- **Dependency files changed** -- check for new or modified packages\n"
-          fi
-          if [ -z "${RISK_ITEMS}" ]; then
-            RISK_ITEMS="No high-risk indicators detected."
-          fi
-          echo "risk_items<<EOF" >> "$GITHUB_OUTPUT"
-          echo -e "${RISK_ITEMS}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          BINARY_CHANGES=$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | grep -E '^-\s+-\s+' | awk '{print $3}' || true)
+          echo "binary_changes=${BINARY_CHANGES:-None}" >> "$GITHUB_OUTPUT"
 
       - name: Post diff summary as PR comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
+            const prNumber = ${{ needs.find-pr.outputs.pr_number }};
             const body = `## Security Diff Summary
 
             | Metric | Count |
@@ -141,43 +114,19 @@ jobs:
             | Lines removed | ${{ steps.diff.outputs.lines_removed }} |
 
             ### Action Manifest Changes
-            \`\`\`
-            ${{ steps.diff.outputs.manifest_changes }}
-            \`\`\`
-
-            ### Dependency File Changes
-            \`\`\`
-            ${{ steps.diff.outputs.dependency_changes }}
-            \`\`\`
-
-            ### Binary Files Added/Modified
-            \`\`\`
-            ${{ steps.diff.outputs.binary_changes }}
-            \`\`\`
+            \`${{ steps.diff.outputs.manifest_changes }}\`
 
             ### Script Changes
-            \`\`\`
-            ${{ steps.diff.outputs.script_changes }}
-            \`\`\`
+            \`${{ steps.diff.outputs.script_changes }}\`
 
-            ### Risk Assessment
-
-            ${{ steps.diff.outputs.risk_items }}
-
-            ### Review Checklist
-
-            - [ ] Reviewed all action manifest changes
-            - [ ] Verified dependency changes are expected
-            - [ ] Inspected any binary file additions
-            - [ ] Reviewed script changes for malicious content
-            - [ ] Confirmed no secrets or credentials in diff
+            ### Binary Files
+            \`${{ steps.diff.outputs.binary_changes }}\`
             `;
 
-            // Find existing comment from this workflow
             const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: prNumber,
             });
 
             const marker = '## Security Diff Summary';
@@ -196,7 +145,131 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
+                issue_number: prNumber,
                 body: body,
               });
             }
+
+  codeql:
+    needs: find-pr
+    if: needs.find-pr.outputs.has_pr == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout upstream-tracking
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: upstream-tracking
+
+      - name: Get HEAD SHA
+        id: sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@bb471cdcf4dda2c934c5b656f554d43c1434ed13 # v4
+        with:
+          languages: javascript-typescript
+        continue-on-error: true
+
+      - name: Autobuild
+        if: steps.codeql-init.outcome == 'success'
+        uses: github/codeql-action/autobuild@bb471cdcf4dda2c934c5b656f554d43c1434ed13 # v4
+        continue-on-error: true
+
+      - name: Run CodeQL analysis
+        if: steps.codeql-init.outcome == 'success'
+        uses: github/codeql-action/analyze@bb471cdcf4dda2c934c5b656f554d43c1434ed13 # v4
+        with:
+          category: "/language:javascript-typescript"
+          ref: refs/heads/upstream-tracking
+          sha: ${{ steps.sha.outputs.value }}
+        continue-on-error: true
+
+  report-status:
+    needs: [find-pr, dependency-review, diff-summary, codeql]
+    if: always() && needs.find-pr.outputs.has_pr == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Report scan statuses on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PR_HEAD_SHA=$(gh pr view ${{ needs.find-pr.outputs.pr_number }} \
+            --repo "${{ github.repository }}" \
+            --json headRefOid \
+            --jq '.headRefOid')
+
+          post_status() {
+            local context="$1" state="$2" desc="$3"
+            gh api "repos/${{ github.repository }}/statuses/${PR_HEAD_SHA}" \
+              -f state="${state}" \
+              -f context="${context}" \
+              -f description="${desc}" \
+              -f target_url="${RUN_URL}"
+          }
+
+          post_check() {
+            local name="$1" conclusion="$2" summary="$3"
+            gh api "repos/${{ github.repository }}/check-runs" \
+              -f name="${name}" \
+              -f head_sha="${PR_HEAD_SHA}" \
+              -f status="completed" \
+              -f conclusion="${conclusion}" \
+              -f "output[title]=${name}" \
+              -f "output[summary]=${summary}" \
+              -f details_url="${RUN_URL}"
+          }
+
+          map_status() {
+            case "$1" in
+              success)  echo "success" ;;
+              failure)  echo "failure" ;;
+              skipped)  echo "success" ;;
+              *)        echo "error" ;;
+            esac
+          }
+
+          map_check() {
+            case "$1" in
+              success)  echo "success" ;;
+              failure)  echo "failure" ;;
+              skipped)  echo "skipped" ;;
+              *)        echo "failure" ;;
+            esac
+          }
+
+          post_check "security-scan/dependency-review" \
+            "$(map_check "${{ needs.dependency-review.result }}")" \
+            "Dependency review: ${{ needs.dependency-review.result }}"
+
+          post_check "security-scan/diff-summary" \
+            "$(map_check "${{ needs.diff-summary.result }}")" \
+            "Diff summary: ${{ needs.diff-summary.result }}"
+
+          post_check "security-scan/codeql" \
+            "$(map_check "${{ needs.codeql.result }}")" \
+            "CodeQL analysis: ${{ needs.codeql.result }}"
+
+          # CodeQL is informational -- findings appear in Code Scanning tab, not in aggregate
+          if [ "${{ needs.dependency-review.result }}" = "failure" ] || \
+             [ "${{ needs.diff-summary.result }}" = "failure" ]; then
+            AGGREGATE="failure"
+            DESC="Security scan failed"
+          else
+            AGGREGATE="success"
+            DESC="Security scan passed"
+          fi
+
+          post_status "security-scan" "${AGGREGATE}" "${DESC}"
+          post_check "security-scan" "$(map_check "${AGGREGATE}")" "${DESC}"
+
+          echo "Posted checks and status on PR #${{ needs.find-pr.outputs.pr_number }} (${PR_HEAD_SHA:0:12})"

@@ -28,9 +28,14 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+    outputs:
+      pr_created: ${{ steps.create-pr.outputs.pr_created }}
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+      in_sync: ${{ steps.compare.outputs.in_sync }}
+      merge_success: ${{ steps.merge.outputs.merge_success }}
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           ref: upstream-tracking
@@ -40,6 +45,29 @@ jobs:
 
       - name: Fetch upstream default branch
         run: git fetch upstream ${{ inputs.default_branch }}
+
+      - name: Verify upstream repo identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f FORK_MANIFEST.json ]; then
+            EXPECTED_ID=$(jq -r '.upstream.repo_id // empty' FORK_MANIFEST.json)
+            if [ -n "${EXPECTED_ID}" ]; then
+              ACTUAL_ID=$(gh api "repos/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}" --jq '.id' 2>/dev/null || echo "")
+              if [ -z "${ACTUAL_ID}" ]; then
+                echo "::error::Upstream repo ${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }} is no longer accessible."
+                exit 1
+              elif [ "${ACTUAL_ID}" != "${EXPECTED_ID}" ]; then
+                echo "::error::SECURITY ALERT: Upstream repo ID changed from ${EXPECTED_ID} to ${ACTUAL_ID}."
+                echo "::error::This may indicate the repository was deleted and re-created (name squatting attack)."
+                exit 1
+              else
+                echo "Upstream repo identity verified (ID: ${ACTUAL_ID})"
+              fi
+            else
+              echo "No repo_id in manifest, skipping identity check."
+            fi
+          fi
 
       - name: Compare SHAs
         id: compare
@@ -75,7 +103,7 @@ jobs:
 
       - name: Open divergence issue on merge failure
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'false'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             await github.rest.issues.create({
@@ -87,6 +115,14 @@ jobs:
                 '## Upstream Divergence Detected',
                 '',
                 'The `upstream-tracking` branch has diverged from `${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}@${{ inputs.default_branch }}` and cannot be fast-forward merged.',
+                '',
+                '> **Security Note:** A non-fast-forward divergence may indicate that the upstream repository had its history rewritten (force-push). This is unusual for maintained projects and should be investigated before resolving.',
+                '',
+                '### Investigation Steps',
+                '',
+                '1. Check if the upstream repo was recently transferred, renamed, or recreated.',
+                '2. Review the upstream commit history for signs of force-push or rebase.',
+                '3. Compare the `FORK_MANIFEST.json` `repo_id` against the current upstream repo ID.',
                 '',
                 '### Manual Resolution Steps',
                 '',
@@ -107,11 +143,6 @@ jobs:
                 '   ```bash',
                 '   git push origin upstream-tracking',
                 '   ```',
-                '',
-                '### Details',
-                '',
-                '- **Current SHA:** `${{ steps.compare.outputs.current_sha }}`',
-                '- **Upstream SHA:** `${{ steps.compare.outputs.upstream_sha }}`',
               ].join('\n')
             });
 
@@ -189,35 +220,28 @@ jobs:
             echo "security_files=None detected" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate App token for PR creation
-        if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.FORK_SYNC_APP_ID }}
-          private-key: ${{ secrets.FORK_SYNC_APP_PRIVATE_KEY }}
-
       - name: Create pull request
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
+        id: create-pr
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Check if a PR already exists from upstream-tracking to the default branch
           EXISTING_PR=$(gh pr list \
             --repo "${{ github.repository }}" \
             --base ${{ inputs.default_branch }} \
             --head upstream-tracking \
             --state open \
             --json number \
-            --jq 'length')
+            --jq '.[0].number // empty')
 
-          if [ "${EXISTING_PR}" != "0" ]; then
-            echo "Sync PR already exists, skipping creation."
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "Sync PR already exists (#${EXISTING_PR}), skipping creation."
+            echo "pr_created=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Write PR body to temp file to avoid heredoc indentation issues
-          cat > /tmp/pr_body.md <<'PR_BODY'
+          cat > /tmp/pr_body.md << 'PR_BODY'
           ## Upstream Sync
 
           Syncing changes from [`${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}@${{ inputs.default_branch }}`](https://github.com/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}).
@@ -247,14 +271,18 @@ jobs:
           - [ ] Verify no secrets or credentials exposed
           PR_BODY
 
-          # Strip leading whitespace from each line
           sed -i 's/^          //' /tmp/pr_body.md
 
-          gh pr create \
+          PR_URL=$(gh pr create \
             --repo "${{ github.repository }}" \
             --base ${{ inputs.default_branch }} \
             --head upstream-tracking \
             --title "chore: sync upstream ${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}" \
             --label "upstream-sync" \
             --label "needs-security-review" \
-            --body-file /tmp/pr_body.md
+            --body-file /tmp/pr_body.md)
+
+          PR_NUM=$(echo "${PR_URL}" | grep -oE '[0-9]+$')
+          echo "pr_created=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUM}" >> "$GITHUB_OUTPUT"
+          echo "Created PR #${PR_NUM}"
