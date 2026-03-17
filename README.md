@@ -121,18 +121,24 @@ jobs:
 ```yaml
 name: Security Scan
 on:
-  pull_request:
-    types: [opened, synchronize, labeled]
+  workflow_run:
+    workflows: ["Sync Upstream"]
+    types: [completed]
 concurrency:
-  group: security-scan-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: security-scan
+  cancel-in-progress: false
 jobs:
   scan:
+    if: github.event.workflow_run.conclusion == 'success'
     uses: SamFleming-TylerTech/fork-action-sync-templates/.github/workflows/security-scan.yml@v1
+    with:
+      default_branch: main
     secrets: inherit
     permissions:
       contents: read
       pull-requests: write
+      statuses: write
+      checks: write
       security-events: write
 ```
 
@@ -156,53 +162,9 @@ git push origin v1.1.0 && git push origin v1 --force
 
 ## Known Limitations
 
-### Security Scan auto-trigger requires a GitHub App (current)
+### CodeQL is limited to JavaScript/TypeScript
 
-The Sync Upstream workflow uses a GitHub App token (`actions/create-github-app-token`) to create PRs. PRs created by a GitHub App identity trigger `pull_request` events normally, so the Security Scan auto-fires without manual intervention.
-
-**Required secrets (per-repo or org-level):**
-
-| Secret | Description |
-|--------|-------------|
-| `FORK_SYNC_APP_ID` | GitHub App ID (numeric) |
-| `FORK_SYNC_APP_PRIVATE_KEY` | GitHub App private key (PEM format) |
-
-**GitHub App setup:**
-1. Create a GitHub App (Settings > Developer settings > GitHub Apps)
-2. Permissions: Contents (read/write), Pull requests (read/write), Issues (read/write)
-3. Webhook: disabled (not needed)
-4. Install the App on the target org or repos
-5. Add the App ID and private key as org-level secrets (inherited by all forks)
-
-**At scale:** One App installation per org. Two org-level secrets. Zero per-fork configuration.
-
-#### Rollback: removing the GitHub App dependency
-
-If the GitHub App cannot be maintained, revert to `GITHUB_TOKEN` by checking out the `v1.0.5` tag:
-
-```
-v1.0.5  -- last version using GITHUB_TOKEN (no App dependency)
-v1.1.0  -- first version using GitHub App token
-```
-
-To roll back the floating `v1` tag:
-```bash
-cd fork-action-sync-templates
-git tag -f v1 v1.0.5
-git push origin v1 --force
-```
-
-All forks using `@v1` will immediately pick up the rollback. The `FORK_SYNC_APP_ID` and `FORK_SYNC_APP_PRIVATE_KEY` secrets can then be removed.
-
-**Impact of rollback:** The Security Scan will no longer auto-trigger when Sync Upstream creates a PR. It will still trigger on any human interaction with the PR:
-
-| Action | Triggers Scan? |
-|--------|---------------|
-| Sync Upstream creates PR (GITHUB_TOKEN) | No |
-| Human adds a label in GitHub UI | Yes (`labeled`) |
-| Human pushes to `upstream-tracking` | Yes (`synchronize`) |
-
-For automated security monitoring at scale, this means scan results are not available until a human touches each PR. If this is acceptable, the rollback is safe. If unattended scanning is required, the GitHub App is necessary.
+CodeQL analysis only runs on JavaScript and TypeScript codebases. Actions written in other languages (Go, Bash, Docker) still receive dependency review and diff summary checks, but no static analysis. CodeQL results are informational only and excluded from the aggregate security-scan status.
 
 ### Concurrency blocks must be in callers only
 
