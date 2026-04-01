@@ -33,6 +33,7 @@ jobs:
       pr_number: ${{ steps.create-pr.outputs.pr_number }}
       in_sync: ${{ steps.compare.outputs.in_sync }}
       merge_success: ${{ steps.merge.outputs.merge_success }}
+      has_security_changes: ${{ steps.security.outputs.has_security_changes }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -51,6 +52,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -f FORK_MANIFEST.json ]; then
+            # Validate manifest integrity
+            SCHEMA_VER=$(jq -r '.schema_version // empty' FORK_MANIFEST.json)
+            if [ -z "${SCHEMA_VER}" ]; then
+              echo "::warning::FORK_MANIFEST.json missing schema_version"
+            fi
+
+            LAST_SHA=$(jq -r '.sync.last_synced_sha // empty' FORK_MANIFEST.json)
+            if [ -n "${LAST_SHA}" ] && ! echo "${LAST_SHA}" | grep -qE '^[0-9a-f]{40}$'; then
+              echo "::error::FORK_MANIFEST.json has invalid last_synced_sha: '${LAST_SHA}'. Manual correction required."
+              exit 1
+            fi
+
             EXPECTED_ID=$(jq -r '.upstream.repo_id // empty' FORK_MANIFEST.json)
             if [ -n "${EXPECTED_ID}" ]; then
               ACTUAL_ID=$(gh api "repos/${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}" --jq '.id' 2>/dev/null || echo "")
@@ -155,10 +168,18 @@ jobs:
       - name: Update FORK_MANIFEST.json
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
         id: manifest
+        env:
+          UPSTREAM_SHA_RAW: ${{ steps.compare.outputs.upstream_sha }}
         run: |
+          SHA="$(echo "${UPSTREAM_SHA_RAW}" | tr -d '[:space:]')"
+          if ! echo "${SHA}" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::Invalid upstream SHA format: '${SHA}'"
+            exit 1
+          fi
+
           if [ -f FORK_MANIFEST.json ]; then
             jq \
-              --arg sha "${{ steps.compare.outputs.upstream_sha }}" \
+              --arg sha "${SHA}" \
               --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               '.sync.last_synced_sha = $sha | .sync.last_synced_date = $date' \
               FORK_MANIFEST.json > FORK_MANIFEST.json.tmp \
@@ -190,9 +211,10 @@ jobs:
         id: diff
         run: |
           DIFF_STATS=$(git diff --stat origin/${{ inputs.default_branch }}...HEAD)
-          echo "diff_stats<<EOF" >> "$GITHUB_OUTPUT"
+          DELIMITER="DIFF_$(head -c 16 /dev/urandom | xxd -p)"
+          echo "diff_stats<<${DELIMITER}" >> "$GITHUB_OUTPUT"
           echo "${DIFF_STATS}" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "${DELIMITER}" >> "$GITHUB_OUTPUT"
 
       - name: Check for security-relevant changes
         if: steps.compare.outputs.in_sync == 'false' && steps.merge.outputs.merge_success == 'true'
@@ -212,9 +234,10 @@ jobs:
 
           if [ -n "${SECURITY_FILES}" ]; then
             echo "has_security_changes=true" >> "$GITHUB_OUTPUT"
-            echo "security_files<<EOF" >> "$GITHUB_OUTPUT"
+            DELIMITER="SEC_$(head -c 16 /dev/urandom | xxd -p)"
+            echo "security_files<<${DELIMITER}" >> "$GITHUB_OUTPUT"
             echo "${SECURITY_FILES}" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "${DELIMITER}" >> "$GITHUB_OUTPUT"
           else
             echo "has_security_changes=false" >> "$GITHUB_OUTPUT"
             echo "security_files=None detected" >> "$GITHUB_OUTPUT"
@@ -273,13 +296,17 @@ jobs:
 
           sed -i 's/^          //' /tmp/pr_body.md
 
+          LABELS="upstream-sync,needs-security-review"
+          if [ "${{ steps.security.outputs.has_security_changes }}" = "true" ]; then
+            LABELS="${LABELS},security-alert"
+          fi
+
           PR_URL=$(gh pr create \
             --repo "${{ github.repository }}" \
             --base ${{ inputs.default_branch }} \
             --head upstream-tracking \
             --title "chore: sync upstream ${{ inputs.upstream_owner }}/${{ inputs.upstream_repo }}" \
-            --label "upstream-sync" \
-            --label "needs-security-review" \
+            --label "${LABELS}" \
             --body-file /tmp/pr_body.md)
 
           PR_NUM=$(echo "${PR_URL}" | grep -oE '[0-9]+$')
