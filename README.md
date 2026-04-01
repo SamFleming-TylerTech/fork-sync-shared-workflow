@@ -8,7 +8,7 @@ When you fork a third-party GitHub Action to pin it for supply chain security, y
 
 Each fork contains thin caller workflows (~20 lines) that reference these reusable workflows via `workflow_call`. Centralized maintenance means bug fixes and detection improvements propagate to all forks automatically via the floating `@v1` tag.
 
-Forks are bootstrapped by [`fork-action.sh`](https://github.com/SamFleming-TylerTech/fork-project-workflow/blob/main/fork-action.sh), which creates the caller workflows, branch structure, and manifest.
+Forks are bootstrapped by [`fork-action.sh`](https://github.com/SamFleming-TylerTech/fork-sync-setup/blob/main/fork-action.sh), which creates the caller workflows, branch structure, and manifest.
 
 ## Workflows
 
@@ -27,10 +27,22 @@ Syncs the fork's `upstream-tracking` branch with the upstream repository's defau
 
 **What it does:**
 - Checks out the fork's `upstream-tracking` branch
-- Fetches the upstream default branch
-- Attempts a fast-forward merge
+- Verifies upstream repo identity against `repo_id` stored in `FORK_MANIFEST.json` (detects name squatting / repo transfer attacks)
+- Fetches the upstream default branch and attempts a fast-forward merge
+- Validates and updates `last_synced_sha` in the manifest (enforces 40-char hex format)
 - Opens an issue if divergence is detected (non-fast-forward)
-- Creates a PR from `upstream-tracking` to the fork's default branch with diff stats and security review checklist
+- Creates a PR from `upstream-tracking` to the fork's default branch with diff stats, security-relevant file list, and review checklist
+- Adds `security-alert` label when security-relevant files are changed (action.yml, Dockerfile, package.json, shell scripts, dist/)
+
+**Outputs:**
+
+| Output | Description |
+|--------|-------------|
+| `pr_created` | Whether a sync PR was created or already exists |
+| `pr_number` | PR number |
+| `in_sync` | Whether the fork is already up to date |
+| `merge_success` | Whether fast-forward merge succeeded |
+| `has_security_changes` | Whether security-relevant files were changed |
 
 ### sync-tags.yml
 
@@ -44,20 +56,22 @@ Monitors upstream tags for new releases, mutations (supply chain risk), and dele
 | `upstream_repo` | string | yes | Name of the upstream repository |
 
 **What it does:**
-- Compares upstream and fork tags using dereferenced commit SHAs (avoids false positives from annotated vs lightweight tag differences)
+- Compares upstream and fork tags using dereferenced commit SHAs (handles annotated vs lightweight tag differences)
+- Sanitizes tag names via allowlist (`a-zA-Z0-9._+-`) to prevent injection
 - Creates issues for new upstream releases with security review checklists
 - Creates security alerts for tag mutations (upstream tag now points to different commit)
+- Detects drift between fork tags and `pinned_tags` in `FORK_MANIFEST.json`
 - Creates notices for tag deletions (upstream removed a tag)
 
 ### security-scan.yml
 
-Runs security analysis on pull requests labeled `upstream-sync`.
+Runs security analysis on sync PRs, triggered via `workflow_run` after Sync Upstream completes.
 
 **No inputs required** -- the pull request context passes through from the caller.
 
 **What it does:**
 - Dependency review (fails on high severity)
-- CodeQL analysis with security-extended queries
+- CodeQL analysis (JavaScript/TypeScript repos only)
 - Diff summary with risk assessment posted as PR comment
 
 ## Usage
@@ -82,7 +96,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   sync:
-    uses: SamFleming-TylerTech/fork-action-sync-templates/.github/workflows/sync-upstream.yml@v1
+    uses: SamFleming-TylerTech/fork-sync-shared-workflow/.github/workflows/sync-upstream.yml@v1
     with:
       upstream_owner: original-owner
       upstream_repo: original-repo
@@ -107,7 +121,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   check-tags:
-    uses: SamFleming-TylerTech/fork-action-sync-templates/.github/workflows/sync-tags.yml@v1
+    uses: SamFleming-TylerTech/fork-sync-shared-workflow/.github/workflows/sync-tags.yml@v1
     with:
       upstream_owner: original-owner
       upstream_repo: original-repo
@@ -130,7 +144,7 @@ concurrency:
 jobs:
   scan:
     if: github.event.workflow_run.conclusion == 'success'
-    uses: SamFleming-TylerTech/fork-action-sync-templates/.github/workflows/security-scan.yml@v1
+    uses: SamFleming-TylerTech/fork-sync-shared-workflow/.github/workflows/security-scan.yml@v1
     with:
       default_branch: main
     secrets: inherit
